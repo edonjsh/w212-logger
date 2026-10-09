@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>W212 Logger</title>
+<link rel="manifest" href="data:application/json,%7B%22name%22%3A%22W212%20Logger%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23101418%22%7D">
+<style>
+/* Single dark theme on purpose: used in the car, often at night. */
+:root { --bg:#101418; --panel:#182027; --line:#26313b; --ink:#e6edf3; --muted:#8b98a5; --accent:#5aa9ff; --ok:#4cc38a; --warn:#f0b04a; --bad:#ff6b6b; color-scheme:dark; }
+* { box-sizing:border-box; }
+html, body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.4 system-ui, "Segoe UI", Roboto, sans-serif; }
+main { padding:calc(env(safe-area-inset-top,0px) + 14px) 16px calc(env(safe-area-inset-bottom,0px) + 20px); display:grid; gap:14px; max-width:640px; margin:0 auto; }
+h1 { margin:0; font-size:20px; font-weight:600; }
+.status { display:flex; flex-wrap:wrap; gap:6px 14px; font-size:13px; color:var(--muted); font-variant-numeric:tabular-nums; }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--bad); margin-right:6px; vertical-align:middle; }
+.dot.on { background:var(--ok); }
+.grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+.tile { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; display:grid; gap:2px; }
+.tile .k { font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; }
+.tile .v { font-size:34px; font-weight:600; font-variant-numeric:tabular-nums; line-height:1.1; }
+.tile .v small { font-size:15px; color:var(--muted); font-weight:500; }
+.tile.hl .v { color:var(--accent); }
+.buttons { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+button { font:600 16px system-ui, sans-serif; padding:14px; border-radius:10px; border:1px solid var(--line); background:var(--panel); color:var(--ink); }
+button.primary { background:var(--accent); border-color:var(--accent); color:#06121f; }
+button:disabled { opacity:.45; }
+button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+.note { font-size:13px; color:var(--muted); }
+.warn { color:var(--warn); }
+#log { font:12px/1.4 ui-monospace, monospace; color:var(--muted); white-space:pre-wrap; max-height:140px; overflow:auto; background:var(--panel); border-radius:8px; padding:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>W212 Logger <span class="note">nur lesend</span></h1>
+  <div class="status"><span><span class="dot" id="dot"></span><span id="conn">nicht verbunden</span></span><span id="rows">0 Zeilen</span><span id="rate"></span><span id="err"></span></div>
+
+  <div class="grid">
+    <div class="tile hl"><span class="k">Ruß 609C</span><span class="v" id="v-soot">–</span></div>
+    <div class="tile hl"><span class="k">Diff.-Druck 61D8</span><span class="v" id="v-dp">–</span></div>
+    <div class="tile"><span class="k">Tempo</span><span class="v" id="v-kmh">– <small>km/h</small></span></div>
+    <div class="tile"><span class="k">Drehzahl</span><span class="v" id="v-rpm">– <small>1/min</small></span></div>
+    <div class="tile"><span class="k">Kühlmittel</span><span class="v" id="v-cool">– <small>°C</small></span></div>
+    <div class="tile"><span class="k">Luftmasse</span><span class="v" id="v-maf">– <small>g/s</small></span></div>
+    <div class="tile"><span class="k">Regenerationen</span><span class="v" id="v-reg">–</span></div>
+    <div class="tile"><span class="k">AdBlue</span><span class="v" id="v-adb">– <small>kg</small></span></div>
+  </div>
+
+  <div class="buttons">
+    <button class="primary" id="b-start" type="button">Verbinden &amp; Start</button>
+    <button id="b-stop" type="button" disabled>Stop</button>
+    <button id="b-export" type="button">Export / Teilen</button>
+    <button id="b-clear" type="button">Daten löschen</button>
+  </div>
+  <p class="note warn">Vor der Fahrt starten, während der Fahrt nicht bedienen. Bildschirm bleibt an, Chrome im Vordergrund lassen.</p>
+  <p class="note">Ein Messpunkt etwa alle 3 s. Daten bleiben im Handy gespeichert, bis du sie löschst. „Export“ erzeugt eine .jsonl-Datei für die Auswertung am Laptop (<code>drive_view.py</code>).</p>
+  <div id="log"></div>
+</main>
+
+<script>
+"use strict";
+// Commands are fixed lists below; checkSafe is a second guard: only OBD 01/03/07 and UDS 22 (all read-only) + init AT.
+const INIT = ["ATZ", "ATE0", "ATL0", "ATS1", "ATH1", "ATSP6", "ATST20"];
+const FAST = ["010C", "010D", "0104", "0110", "22609C", "2261D8"];
+// all supported OBD PIDs of this car (except static ones) + DPF/SCR/km DIDs, every 10th cycle
+const SLOW = ["0105", "010B", "010F", "0111", "011F", "0121", "0123", "0124", "0130", "0131", "0133", "0142", "0145", "0146",
+  "0149", "014A", "014C", "015C", "0166", "0167", "0168", "016C", "016D", "0177", "0185", "0187", "0188",
+  "226059", "226014", "226001", "226095", "2261D9", "226101", "2260DF", "226000", "225017", "225026", "225007", "225018", "225006", "222002"];
+const ROTATE = 5;  // unknown live DIDs per cycle
+const LIVE = ["2000", "2001", "2002", "2003", "2004", "2005", "2007", "2008", "2009", "200A", "200B", "200C", "200E", "2011", "2012", "2013", "2014", "2015", "2016", "2018", "201A", "201B", "201C", "2020", "2021", "2022", "2023", "2024", "2026", "2027", "2028", "2029", "202A", "202B", "202C", "202D", "202E", "202F", "2030", "2031", "2034", "2035", "2036", "2037", "2038", "2039", "203B", "203C", "203D", "203E", "2040", "2041", "2045", "2047", "3003", "3004", "3008", "4000", "4002", "4003", "400D", "400E", "4011", "4013", "4014", "4015", "4018", "4019", "401A", "5003", "5006", "5009", "500D", "500F", "5010", "5012", "5014", "5016", "5018", "5021", "5025", "5027", "5028", "5029", "502A", "502E", "5030", "5033", "5034", "5035", "5036", "5037", "5038", "5039", "5040", "5043", "5044", "5045", "5053", "5058", "6002", "6004", "6006", "6008", "6009", "600A", "600E", "600F", "6012", "6013", "6015", "6019", "601A", "601F", "6022", "6023", "6024", "6026", "6027", "6033", "6034", "6039", "603A", "603C", "603D", "603E", "603F", "6040", "6043", "6046", "604A", "604F", "6051", "6057", "605C", "605E", "6060", "6061", "6062", "6063", "6064", "6065", "6066", "6067", "6068", "6069", "606A", "606C", "606D", "606E", "6072", "6076", "6077", "6078", "607A", "607B", "607E", "6080", "6082", "6083", "6084", "6085", "6086", "6087", "6088", "608B", "608F", "6090", "6091", "6092", "6093", "6096", "6097", "6098", "6099", "609A", "609B", "609D", "609E", "60A0", "60A2", "60A3", "60B4", "60B5", "60B7", "60B8", "60BA", "60BB", "60BD", "60BE", "60BF", "60C0", "60C1", "60C2", "60C5", "60C6", "60C7", "60CB", "60CE", "60DA", "60DB", "60DD", "60E0", "60E1", "60E6", "60E9", "60EA", "60EB", "60F1", "60F3", "60F4", "60F5", "60F6", "60F7", "60FA", "60FC", "60FD", "60FE", "60FF", "6102", "6103", "6104", "6106", "6107", "6109", "610D", "610E", "610F", "6110", "6111", "611C", "611D", "611E", "611F", "6120", "6142", "6146", "6170", "6172", "6175", "61A1", "61A6", "61D1", "61D2", "61D3", "61F4", "61F5", "61F8", "620F", "6216", "621B", "6245", "6246", "6247", "624E", "626C", "628F", "62C0", "631B", "6325", "6344", "6359", "635E", "6378", "637E", "63BD", "63BF", "63C2", "63C5", "63C7", "6422", "6426", "6576", "670A", "6837", "6838", "6839", "683A", "683B", "684A", "684B", "684C", "685D", "685E", "685F", "6866", "686B", "686C", "6870", "6877", "696D", "8363", "8366", "8899", "8980", "99EF", "99F0", "9A85", "9A86", "9A87", "9A88", "9A89", "B000", "B001", "B002", "C111", "C113", "C352", "C356", "C357", "C359", "C35F", "C364", "C368", "C36B", "C36C", "C36D", "C3C1", "C3EA", "C3EB", "C3EC", "C3FB", "CD03", "CD04", "CD07", "CD09", "CD0B", "CD11", "CD28", "D010", "D011", "D012", "D013", "D016", "D017", "D01A", "D01F", "D050", "D053", "D054", "D055", "D058", "D05B", "D060", "D062", "D078", "D081", "D082", "F80B"];  // DIDs that changed between full scan and snapshot A, read ROTATE per cycle in rotation
+function checkSafe(c) {
+  if (INIT.includes(c)) return c;
+  if (/^(01[0-9A-F]{2}|03|07|22[0-9A-F]{4})$/.test(c)) return c;
+  throw new Error("blockiert: " + c);
+}
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const logEl = $("log");
+function log(m) { logEl.textContent = (new Date().toLocaleTimeString() + " " + m + "\n" + logEl.textContent).slice(0, 4000); }
+
+// ---- storage (IndexedDB, one record per cycle)
+let db;
+function openDb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("w212", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("rows", { autoIncrement: true });
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });
+}
+function store(op, fn) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction("rows", op); const q = fn(tx.objectStore("rows"));
+    tx.oncomplete = () => res(q && q.result); tx.onerror = () => rej(tx.error);
+  });
+}
+const addRow = row => store("readwrite", s => s.add(row));
+const countRows = () => store("readonly", s => s.count());
+const allRows = () => store("readonly", s => s.getAll());
+const clearRows = () => store("readwrite", s => s.clear());
+
+// ---- ELM327 over Web Bluetooth (service FFF0, write FFF2, notify FFF1)
+let dev, tx, buf = "", wake, running = false, waiter = null;
+const dec = new TextDecoder();
+function onNotify(e) {
+  buf += dec.decode(e.target.value);
+  if (buf.includes(">") && waiter) { const w = waiter; waiter = null; w(); }
+}
+async function connect() {
+  if (!dev) {
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ namePrefix: "OBDII" }], optionalServices: [0xfff0] });
+    dev.addEventListener("gattserverdisconnected", () => { setConn(false); log("Verbindung getrennt"); });
+  }
+  const server = await dev.gatt.connect();
+  const svc = await server.getPrimaryService(0xfff0);
+  tx = await svc.getCharacteristic(0xfff2);
+  const rx = await svc.getCharacteristic(0xfff1);
+  await rx.startNotifications();
+  rx.addEventListener("characteristicvaluechanged", onNotify);
+  for (const c of INIT) await cmd(c, 8000);
+  setConn(true);
+}
+async function cmd(c, timeout = 5000) {
+  checkSafe(c);
+  await sleep(50);  // the clone drops commands sent right after the prompt
+  buf = "";
+  const done = new Promise((res, rej) => { waiter = res; setTimeout(() => rej(new Error("timeout " + c)), timeout); });
+  const data = new TextEncoder().encode(c + "\r");
+  await (tx.writeValueWithResponse ? tx.writeValueWithResponse(data) : tx.writeValue(data));
+  await done;
+  return buf.split(/[\r\n]+/).map(s => s.trim()).filter(s => s && s !== ">" && s !== c).map(s => s.replace(/>$/, "").trim());
+}
+
+// Response lines "7E8 10 0F 62 ..." -> {ecu: hex payload after positive SID (+PID/DID)}
+function parse(lines, sid, skip) {
+  const frames = {};
+  for (const l of lines) {
+    const b = l.split(/\s+/);
+    if (b.length > 3 && /^7E[89A-F]$/.test(b[0])) (frames[b[0]] ||= []).push(b.slice(1));
+  }
+  const out = {};
+  for (const [ecu, fs] of Object.entries(frames)) {
+    let p;
+    if (fs[0][0].startsWith("1")) {
+      const len = (parseInt(fs[0][0][1], 16) << 8) + parseInt(fs[0][1], 16);
+      p = fs[0].slice(2).concat(...fs.slice(1).map(f => f.slice(1))).slice(0, len);
+    } else p = fs[0].slice(1, 1 + parseInt(fs[0][0], 16));
+    if (p[0] === (sid + 0x40).toString(16).toUpperCase()) out[ecu] = p.slice(1 + skip).join("").toLowerCase();
+  }
+  return out;
+}
+
+async function read(c, row) {
+  try {
+    const lines = await cmd(c);
+    if (c.startsWith("01")) {
+      const p = parse(lines, 0x01, 1), ecu = Object.keys(p).sort()[0];
+      if (ecu) row.pid[c.slice(2)] = p[ecu];
+    } else if (c.startsWith("22")) {
+      const p = parse(lines, 0x22, 2);
+      if (Object.keys(p).length) row.did[c.slice(2)] = p;
+    } else row.dtc[c] = lines;
+  } catch (e) {
+    $("err").textContent = e.message;
+    if (!dev.gatt.connected) throw e;
+  }
+}
+
+const u = (h, i = 0, n = 2) => parseInt(h.slice(i * 2, (i + n) * 2), 16);
+const last = {};
+function show(row) {
+  Object.assign(last, row.pid); for (const [d, v] of Object.entries(row.did)) last[d] = v;
+  const set = (id, val, unit) => { if (val !== undefined && !Number.isNaN(val)) $(id).innerHTML = val + (unit ? ` <small>${unit}</small>` : ""); };
+  const e8 = d => last[d] && last[d]["7E8"], ec = d => last[d] && last[d]["7EC"];
+  if (e8("609C")) set("v-soot", u(e8("609C"), 0, 4));
+  if (e8("61D8")) set("v-dp", u(e8("61D8")));
+  if (last["0D"]) set("v-kmh", u(last["0D"], 0, 1), "km/h");
+  if (last["0C"]) set("v-rpm", Math.round(u(last["0C"]) / 4), "1/min");
+  if (last["05"]) set("v-cool", u(last["05"], 0, 1) - 40, "°C");
+  if (last["10"]) set("v-maf", (u(last["10"]) / 100).toFixed(1), "g/s");
+  if (e8("6059")) set("v-reg", u(e8("6059")));
+  if (ec("6014")) set("v-adb", (u(ec("6014"), 0, 4) / 1000).toFixed(2).replace(".", ","), "kg");
+}
+
+async function loop() {
+  let n = 0, li = 0, t0 = Date.now();
+  while (running) {
+    try {
+      if (!dev.gatt.connected) { log("verbinde neu …"); await connect(); }
+      const row = { t: Math.round(Date.now() / 100) / 10, pid: {}, did: {}, dtc: {} };
+      const list = FAST.concat(n % 10 === 0 ? SLOW : [], n % 100 === 0 ? ["03", "07"] : [],
+        Array.from({ length: LIVE.length ? ROTATE : 0 }, () => "22" + LIVE[li++ % LIVE.length]));
+      for (const c of list) { if (!running) break; await read(c, row); }
+      if (!Object.keys(row.dtc).length) delete row.dtc;
+      await addRow(row); show(row); n++;
+      $("rows").textContent = (await countRows()) + " Zeilen";
+      $("rate").textContent = ((Date.now() - t0) / n / 1000).toFixed(1) + " s/Messpunkt";
+    } catch (e) {
+      log("Fehler: " + e.message); setConn(false); await sleep(3000);
+    }
+  }
+}
+
+function setConn(on) { $("dot").classList.toggle("on", on); $("conn").textContent = on ? "verbunden" : "nicht verbunden"; }
+
+$("b-start").onclick = async () => {
+  try {
+    if (!navigator.bluetooth) { log("Web Bluetooth fehlt: Chrome auf Android und https nötig."); return; }
+    await connect();
+    try { wake = await navigator.wakeLock.request("screen"); } catch (e) { log("Bildschirm-an nicht möglich"); }
+    running = true; $("b-start").disabled = true; $("b-stop").disabled = false;
+    log("Logger läuft"); loop();
+  } catch (e) { log("Start fehlgeschlagen: " + e.message); }
+};
+$("b-stop").onclick = async () => {
+  running = false; $("b-start").disabled = false; $("b-stop").disabled = true;
+  if (wake) wake.release(); if (dev && dev.gatt.connected) dev.gatt.disconnect();
+  log("gestoppt");
+};
+$("b-export").onclick = async () => {
+  const rows = await allRows();
+  if (!rows.length) { log("keine Daten"); return; }
+  const name = "drive_phone_" + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "") + ".jsonl";
+  const file = new File([rows.map(r => JSON.stringify(r)).join("\n") + "\n"], name, { type: "application/json" });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: name }); return; } catch (e) { /* fall back to download */ }
+  }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(file); a.download = name; a.click();
+  log(rows.length + " Zeilen exportiert: " + name);
+};
+$("b-clear").onclick = async () => {
+  if (!confirm("Alle gespeicherten Messdaten löschen? Vorher exportieren.")) return;
+  await clearRows(); $("rows").textContent = "0 Zeilen"; log("Daten gelöscht");
+};
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist();  // ask Chrome not to evict the log
+openDb().then(async () => { $("rows").textContent = (await countRows()) + " Zeilen"; });
+document.addEventListener("visibilitychange", async () => {
+  if (running && document.visibilityState === "visible") { try { wake = await navigator.wakeLock.request("screen"); } catch (e) {} }
+});
+</script>
+</body>
+</html>
